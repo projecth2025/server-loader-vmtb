@@ -5,15 +5,15 @@ interface MeetingLoaderProps {
 }
 
 export default function MeetingLoader({ elapsedSeconds }: MeetingLoaderProps) {
-  debugLog(`MeetingLoader: Rendering (elapsed: ${elapsedSeconds}s)`)
+  debugLog(`[LOADER] Rendering (${elapsedSeconds}s)`)
 
   return (
-    <div className="loader-container">
+    <div className="loader-container" style={{ minHeight: '100vh', width: '100%' }}>
       <div className="loader-content">
         <div className="spinner"></div>
         <h2 className="loader-title">Initializing Meeting</h2>
         <p className="loader-status">
-          <span className="status-badge">Connecting...</span>
+          <span className="status-badge">Connecting to server...</span>
         </p>
         <p className="loader-time">
           {elapsedSeconds} second{elapsedSeconds !== 1 ? 's' : ''} elapsed

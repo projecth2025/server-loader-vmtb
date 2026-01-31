@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import MeetingLoader from '../components/MeetingLoader'
 import ErrorPage from '../components/ErrorPage'
 import ThankYouPage from '../components/ThankYouPage'
@@ -18,55 +18,72 @@ export default function MeetingPage() {
   const [error, setError] = useState<string>('')
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
 
+  // Refs for preventing double initialization and cleanup
+  const isInitializedRef = useRef(false)
   const meetingServiceRef = useRef<MeetingService | null>(null)
   const jitsiApiRef = useRef<any>(null)
-  const jitsiScriptPromiseRef = useRef<Promise<void> | null>(null)
-  const timerRef = useRef<NodeJS.Timeout | null>(null)
+  const timerIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const roomNameRef = useRef<string>('')
+  const jitsiContainerRef = useRef<HTMLDivElement | null>(null)
 
-  const roomName = useRef<string>('')
+  // Cleanup timer
+  const stopTimer = useCallback(() => {
+    if (timerIntervalRef.current) {
+      clearInterval(timerIntervalRef.current)
+      timerIntervalRef.current = null
+      debugLog('[TIMER] Stopped')
+    }
+  }, [])
 
-  // Load Jitsi script dynamically
-  const loadJitsiScript = (): Promise<void> => {
-    if (jitsiScriptPromiseRef.current) {
-      return jitsiScriptPromiseRef.current
+  // Start timer
+  const startTimer = useCallback(() => {
+    stopTimer() // Clear any existing timer first
+    debugLog('[TIMER] Starting')
+    timerIntervalRef.current = setInterval(() => {
+      setElapsedSeconds(prev => prev + 1)
+    }, 1000)
+  }, [stopTimer])
+
+  // Handle meeting end - show thank you page
+  const handleMeetingEnd = useCallback(() => {
+    debugLog('[MEETING-END] ========================================')
+    debugLog('[MEETING-END] User left the conference')
+
+    // Dispose Jitsi API
+    if (jitsiApiRef.current) {
+      try {
+        jitsiApiRef.current.dispose()
+        jitsiApiRef.current = null
+        debugLog('[MEETING-END] ✓ Jitsi disposed')
+      } catch (e) {
+        debugLog('[MEETING-END] Dispose error (ignored):', e)
+      }
     }
 
-    jitsiScriptPromiseRef.current = new Promise((resolve, reject) => {
-      const domain = import.meta.env.VITE_JITSI_DOMAIN
-      const scriptUrl = `https://${domain}/external_api.js`
-      debugLog(`JITSI: Loading script from ${scriptUrl}`)
+    // Clear container
+    if (jitsiContainerRef.current) {
+      jitsiContainerRef.current.innerHTML = ''
+      jitsiContainerRef.current.style.display = 'none'
+      debugLog('[MEETING-END] ✓ Container cleared')
+    }
 
-      const script = document.createElement('script')
-      script.src = scriptUrl
-      script.async = true
-      script.onload = () => {
-        debugLog('JITSI: Script loaded successfully')
-        resolve()
-      }
-      script.onerror = () => {
-        debugLog('JITSI: Script load failed')
-        reject(new Error('Failed to load Jitsi'))
-      }
-      document.head.appendChild(script)
-    })
+    // Show thank you page
+    debugLog('[MEETING-END] Showing thank you page')
+    setState('THANK_YOU')
+  }, [])
 
-    return jitsiScriptPromiseRef.current
-  }
+  // Initialize Jitsi in the container
+  const initJitsiInContainer = useCallback((container: HTMLDivElement) => {
+    debugLog('[JITSI] ========================================')
+    debugLog('[JITSI] Initializing in container')
+    debugLog('[JITSI] Room:', roomNameRef.current)
+    debugLog('[JITSI] Domain:', import.meta.env.VITE_JITSI_DOMAIN)
 
-  // Initialize Jitsi meeting
-  const initJitsi = async () => {
     try {
-      debugLog('JITSI: Initializing with room:', roomName.current)
-
-      const container = document.getElementById('jitsi-container')
-      if (!container) {
-        throw new Error('Jitsi container not found')
-      }
-
       const api = new window.JitsiMeetExternalAPI(
         import.meta.env.VITE_JITSI_DOMAIN,
         {
-          roomName: roomName.current,
+          roomName: roomNameRef.current,
           parentNode: container,
           width: '100%',
           height: '100%',
@@ -87,103 +104,192 @@ export default function MeetingPage() {
       )
 
       jitsiApiRef.current = api
-      debugLog('JITSI: API ready')
+      debugLog('[JITSI] ✓ API created')
 
-      // Listen for video conference left
+      // Event handlers
       api.addEventListener('videoConferenceLeft', () => {
-        debugLog('JITSI: Conference left event')
+        debugLog('[JITSI] Event: videoConferenceLeft')
         handleMeetingEnd()
       })
 
-      // Listen for ready to close
       api.addEventListener('readyToClose', () => {
-        debugLog('JITSI: Ready to close event')
+        debugLog('[JITSI] Event: readyToClose')
         handleMeetingEnd()
       })
 
-      // Participant events (optional)
-      api.addEventListener('participantJoined', (participant: any) => {
-        debugLog('JITSI: Participant joined:', participant.id)
+      debugLog('[JITSI] ========================================')
+      return true
+    } catch (err) {
+      debugLog('[JITSI] ❌ Init error:', err)
+      return false
+    }
+  }, [handleMeetingEnd])
+
+  // Load Jitsi external API script with retries
+  const loadJitsiScript = useCallback((): Promise<void> => {
+    const domain = import.meta.env.VITE_JITSI_DOMAIN
+    const scriptUrl = `https://${domain}/external_api.js`
+    const maxRetries = 6
+    const retryDelay = 5000 // 5 seconds between retries
+
+    const attemptLoad = (attempt: number): Promise<void> => {
+      return new Promise((resolve, reject) => {
+        // Already loaded
+        if (window.JitsiMeetExternalAPI) {
+          debugLog('[SCRIPT] Already loaded')
+          resolve()
+          return
+        }
+
+        // Remove any failed script tags from previous attempts
+        const existingFailed = document.querySelector('script[src*="external_api.js"]')
+        if (existingFailed && !window.JitsiMeetExternalAPI) {
+          existingFailed.remove()
+        }
+
+        debugLog(`[SCRIPT] Loading (attempt ${attempt}/${maxRetries}): ${scriptUrl}`)
+
+        const script = document.createElement('script')
+        script.src = scriptUrl
+        script.async = true
+        
+        script.onload = () => {
+          debugLog('[SCRIPT] ✓ Loaded')
+          resolve()
+        }
+        
+        script.onerror = () => {
+          debugLog(`[SCRIPT] ❌ Failed (attempt ${attempt})`)
+          
+          // Remove the failed script tag
+          script.remove()
+          
+          if (attempt < maxRetries) {
+            debugLog(`[SCRIPT] Retrying in ${retryDelay/1000}s...`)
+            setTimeout(() => {
+              attemptLoad(attempt + 1).then(resolve).catch(reject)
+            }, retryDelay)
+          } else {
+            reject(new Error('Failed to load Jitsi script after multiple attempts'))
+          }
+        }
+        
+        document.head.appendChild(script)
+      })
+    }
+
+    return attemptLoad(1)
+  }, [])
+
+  // Main initialization effect
+  useEffect(() => {
+    // Prevent double initialization (React StrictMode)
+    if (isInitializedRef.current) {
+      debugLog('[INIT] Already initialized, skipping')
+      return
+    }
+    isInitializedRef.current = true
+
+    debugLog('[INIT] ========================================')
+    debugLog('[INIT] Starting initialization')
+    debugLog('[INIT] URL:', window.location.href)
+
+    // Get room name from URL
+    const room = getRoomNameFromUrl()
+    if (!room) {
+      debugLog('[INIT] ❌ No room in URL')
+      setError('No room name provided. Please start the meeting from the main app.')
+      setState('ERROR')
+      return
+    }
+    roomNameRef.current = room
+    debugLog('[INIT] Room:', room)
+
+    // Start the elapsed time timer
+    startTimer()
+
+    // Create meeting service and start polling
+    const service = new MeetingService()
+    meetingServiceRef.current = service
+
+    debugLog('[INIT] Starting polling...')
+
+    service.waitForMeetingReady()
+      .then(async () => {
+        debugLog('[INIT] ✓ Server ready!')
+        // Note: Keep timer running during script loading
+
+        // Load Jitsi script (may take time with retries)
+        debugLog('[INIT] Loading Jitsi script...')
+        await loadJitsiScript()
+
+        // Stop timer only after script loads successfully
+        stopTimer()
+
+        // Now set state to READY which will render the container
+        debugLog('[INIT] Setting state to READY')
+        setState('READY')
+      })
+      .catch((err) => {
+        debugLog('[INIT] ❌ Polling error:', err)
+        stopTimer()
+
+        // Ignore abort errors
+        if (err?.message?.includes('abort')) {
+          debugLog('[INIT] Abort error ignored')
+          return
+        }
+
+        setError('Unable to connect to meeting server. Please try again.')
+        setState('ERROR')
       })
 
-      api.addEventListener('participantLeft', (participant: any) => {
-        debugLog('JITSI: Participant left:', participant.id)
-      })
-
-      setState('READY')
-    } catch (err) {
-      debugLog('JITSI: Error', err)
-      throw err
-    }
-  }
-
-  // Handle meeting end
-  const handleMeetingEnd = () => {
-    debugLog('MEETING: Meeting ended, showing thank you page...')
-
-    if (jitsiApiRef.current) {
-      try {
-        jitsiApiRef.current.dispose()
-      } catch (e) {
-        debugLog('MEETING: Error disposing Jitsi API', e)
+    // Cleanup function
+    return () => {
+      debugLog('[INIT] Cleanup on unmount')
+      stopTimer()
+      if (meetingServiceRef.current) {
+        meetingServiceRef.current.cleanup()
+        meetingServiceRef.current = null
       }
+      // Reset initialization flag so StrictMode remount can re-initialize
+      isInitializedRef.current = false
     }
+  }, [startTimer, stopTimer, loadJitsiScript])
 
-    // Clear container
-    const container = document.getElementById('jitsi-container')
-    if (container) {
-      container.innerHTML = ''
-    }
+  // Effect to initialize Jitsi when container is available (READY state)
+  useEffect(() => {
+    if (state !== 'READY') return
+    if (!jitsiContainerRef.current) return
+    if (jitsiApiRef.current) return // Already initialized
 
-    // Show thank you page
-    setState('THANK_YOU')
-  }
-
-  // Initialize meeting on mount
-  const initMeeting = async () => {
-    try {
-      debugLog('MEETING: Initializing meeting...')
-
-      // Get room name from URL
-      const room = getRoomNameFromUrl()
-      if (!room) {
-        throw new Error('No room name provided in URL')
-      }
-      roomName.current = room
-      debugLog('MEETING: Room name:', room)
-
-      // Initialize meeting service
-      meetingServiceRef.current = new MeetingService()
-      await meetingServiceRef.current.waitForMeetingReady()
-
-      debugLog('MEETING: Backend confirmed, redirecting to meet.vmtb.in...')
-
-      // Redirect to meet.vmtb.in with room name
-      const jitsiDomain = import.meta.env.VITE_JITSI_DOMAIN
-      const meetUrl = `https://${jitsiDomain}/${roomName.current}`
-      debugLog('MEETING: Redirecting to:', meetUrl)
-      window.location.href = meetUrl
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
-      debugLog('MEETING: Error during initialization', errorMessage)
-      setError(errorMessage)
+    debugLog('[EFFECT] Container ready, initializing Jitsi...')
+    
+    const success = initJitsiInContainer(jitsiContainerRef.current)
+    if (!success) {
+      setError('Failed to start meeting. Please try again.')
       setState('ERROR')
     }
-  }
+  }, [state, initJitsiInContainer])
 
-  // Handle back button
-  const handleBack = () => {
-    debugLog('MEETING: User clicked back')
-    window.location.href = 'https://vmtb.in'
-  }
+  // Retry handler
+  const handleRetry = useCallback(() => {
+    debugLog('[RETRY] Reloading page')
+    window.location.reload()
+  }, [])
 
-  // Handle thank you return
-  const handleThankYouReturn = () => {
-    debugLog('MEETING: User clicked return from thank you')
-    window.location.href = 'https://vmtb.in'
-  }
+  // Back handler
+  const handleBack = useCallback(() => {
+    debugLog('[NAV] Going back')
+    stopTimer()
+    if (meetingServiceRef.current) {
+      meetingServiceRef.current.cleanup()
+    }
+    window.location.href = import.meta.env.VITE_MAIN_APP_URL || 'http://localhost:5173'
+  }, [stopTimer])
 
-  // Render based on state
+  // ===== RENDER =====
+
   if (state === 'LOADING') {
     return <MeetingLoader elapsedSeconds={elapsedSeconds} />
   }
@@ -193,9 +299,28 @@ export default function MeetingPage() {
   }
 
   if (state === 'THANK_YOU') {
-    return <ThankYouPage onBackToApp={handleThankYouReturn} />
+    return <ThankYouPage />
   }
 
-  // READY state: This state should not be reached as we redirect to meet.vmtb.in
-  return null
+  // READY state: Render the Jitsi container
+  return (
+    <div 
+      ref={jitsiContainerRef}
+      id="jitsi-container" 
+      style={{ 
+        position: 'fixed',
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        width: '100%',
+        height: '100%',
+        margin: 0,
+        padding: 0,
+        backgroundColor: '#000',
+        zIndex: 9999,
+        overflow: 'hidden'
+      }} 
+    />
+  )
 }
