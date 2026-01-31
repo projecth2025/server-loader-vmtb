@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef } from 'react'
 import MeetingLoader from '../components/MeetingLoader'
 import ErrorPage from '../components/ErrorPage'
+import ThankYouPage from '../components/ThankYouPage'
 import { MeetingService } from '../services/meetingService'
-import { getRoomNameFromUrl, getReturnUrl, debugLog } from '../utils/sanitization'
+import { getRoomNameFromUrl, debugLog } from '../utils/sanitization'
 
-type PageState = 'LOADING' | 'READY' | 'ERROR'
+type PageState = 'LOADING' | 'READY' | 'ERROR' | 'THANK_YOU'
 
 declare global {
   interface Window {
@@ -23,7 +24,6 @@ export default function MeetingPage() {
   const timerRef = useRef<NodeJS.Timeout | null>(null)
 
   const roomName = useRef<string>('')
-  const returnUrl = useRef<string>('')
 
   // Load Jitsi script dynamically
   const loadJitsiScript = (): Promise<void> => {
@@ -119,7 +119,7 @@ export default function MeetingPage() {
 
   // Handle meeting end
   const handleMeetingEnd = () => {
-    debugLog('MEETING: Meeting ended, cleaning up...')
+    debugLog('MEETING: Meeting ended, showing thank you page...')
 
     if (jitsiApiRef.current) {
       try {
@@ -135,9 +135,8 @@ export default function MeetingPage() {
       container.innerHTML = ''
     }
 
-    // Redirect to main app
-    debugLog('MEETING: Redirecting to', returnUrl.current)
-    window.location.href = returnUrl.current
+    // Show thank you page
+    setState('THANK_YOU')
   }
 
   // Initialize meeting on mount
@@ -153,21 +152,17 @@ export default function MeetingPage() {
       roomName.current = room
       debugLog('MEETING: Room name:', room)
 
-      // Get return URL
-      returnUrl.current = getReturnUrl()
-      debugLog('MEETING: Return URL:', returnUrl.current)
-
       // Initialize meeting service
       meetingServiceRef.current = new MeetingService()
       await meetingServiceRef.current.waitForMeetingReady()
 
-      debugLog('MEETING: Backend confirmed, loading Jitsi...')
+      debugLog('MEETING: Backend confirmed, redirecting to meet.vmtb.in...')
 
-      // Load Jitsi script
-      await loadJitsiScript()
-
-      // Initialize Jitsi
-      await initJitsi()
+      // Redirect to meet.vmtb.in with room name
+      const jitsiDomain = import.meta.env.VITE_JITSI_DOMAIN
+      const meetUrl = `https://${jitsiDomain}/${roomName.current}`
+      debugLog('MEETING: Redirecting to:', meetUrl)
+      window.location.href = meetUrl
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : 'Unknown error'
       debugLog('MEETING: Error during initialization', errorMessage)
@@ -176,47 +171,17 @@ export default function MeetingPage() {
     }
   }
 
-  // Handle retry
-  const handleRetry = () => {
-    debugLog('MEETING: User clicked retry')
-    setError('')
-    setState('LOADING')
-    setElapsedSeconds(0)
-    initMeeting()
-  }
-
   // Handle back button
   const handleBack = () => {
     debugLog('MEETING: User clicked back')
-    window.location.href = returnUrl.current || 'https://vmtb.in'
+    window.location.href = 'https://vmtb.in'
   }
 
-  // Initialize on mount
-  useEffect(() => {
-    initMeeting()
-
-    return () => {
-      if (meetingServiceRef.current) {
-        meetingServiceRef.current.cleanup()
-      }
-      if (timerRef.current) {
-        clearInterval(timerRef.current)
-      }
-    }
-  }, [])
-
-  // Increment elapsed time
-  useEffect(() => {
-    if (state !== 'LOADING') return
-
-    timerRef.current = setInterval(() => {
-      setElapsedSeconds((prev) => prev + 1)
-    }, 1000)
-
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current)
-    }
-  }, [state])
+  // Handle thank you return
+  const handleThankYouReturn = () => {
+    debugLog('MEETING: User clicked return from thank you')
+    window.location.href = 'https://vmtb.in'
+  }
 
   // Render based on state
   if (state === 'LOADING') {
@@ -227,6 +192,10 @@ export default function MeetingPage() {
     return <ErrorPage error={error} onRetry={handleRetry} onBack={handleBack} />
   }
 
-  // READY state: Jitsi is rendering in the container
+  if (state === 'THANK_YOU') {
+    return <ThankYouPage onBackToApp={handleThankYouReturn} />
+  }
+
+  // READY state: This state should not be reached as we redirect to meet.vmtb.in
   return null
 }
