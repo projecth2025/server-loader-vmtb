@@ -1,18 +1,22 @@
 import { getSupabaseClient, isSupabaseConfigured } from '../lib/supabase';
-import { debugLog } from '../utils/sanitization';
 
 /**
- * Meeting Analytics Service
+ * Meeting Analytics Service - Correct Flow
  * 
- * Handles all meeting tracking operations:
- * - Creating meeting sessions (when first participant joins)
- * - Tracking participant joins/leaves
- * - Ending meeting sessions (when last participant leaves)
+ * PRINCIPLES:
+ * 1. Frontend ONLY creates/updates its OWN records
+ * 2. Frontend NEVER closes/modifies other meetings
+ * 3. Stale meetings are IGNORED (filtered out), not closed
+ * 4. Meeting is marked 'ended' ONLY when user explicitly leaves via Jitsi event
  * 
- * Designed to work even with:
- * - Tab closes (uses beforeunload)
- * - Internet disconnections (Jitsi events)
- * - Browser crashes (session marked stale on next load)
+ * FLOW:
+ * 1. User joins → Check for recent active session (heartbeat < 2 min old)
+ *    - Found? Join that session
+ *    - Not found? Create NEW session (ignore stale ones)
+ * 2. While in meeting → Send heartbeat every 30s
+ * 3. User leaves (Jitsi event) → Mark session as 'ended'
+ * 4. User closes tab → Heartbeat stops, session stays 'active' but becomes stale
+ *    → Next join will ignore it and create new session
  */
 
 export interface MeetingSession {
@@ -24,6 +28,7 @@ export interface MeetingSession {
   total_duration_seconds: number | null;
   max_participants: number;
   status: 'active' | 'ended';
+  last_heartbeat: string;
 }
 
 export interface MeetingParticipant {
@@ -34,7 +39,7 @@ export interface MeetingParticipant {
   joined_at: string;
   left_at: string | null;
   duration_seconds: number | null;
-  left_reason: 'normal' | 'tab_closed' | 'disconnected' | 'unknown' | null;
+  left_reason: string | null;
 }
 
 export interface MeetingParams {
@@ -43,19 +48,25 @@ export interface MeetingParams {
   mtbName?: string;
 }
 
+// Heartbeat interval - send heartbeat every 30 seconds
+const HEARTBEAT_INTERVAL_MS = 30 * 1000;
+
+// Stale threshold - session is considered stale if no heartbeat for 2 minutes
+const STALE_THRESHOLD_MINUTES = 2;
+
 export class MeetingAnalyticsService {
   private supabase = getSupabaseClient();
   private meetingSessionId: string | null = null;
   private currentParticipantId: string | null = null;
-  private localParticipantDbId: string | null = null; // Database ID for our participant record
+  private localParticipantDbId: string | null = null;
   private params: MeetingParams | null = null;
   private participantCount: number = 0;
   private maxParticipants: number = 0;
   private isTracking: boolean = false;
+  private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+  private hasEnded: boolean = false;
 
   constructor() {
-    // Bind methods for event handlers
-    this.handleBeforeUnload = this.handleBeforeUnload.bind(this);
     this.handleVisibilityChange = this.handleVisibilityChange.bind(this);
   }
 
@@ -63,48 +74,188 @@ export class MeetingAnalyticsService {
    * Initialize analytics tracking for a meeting
    */
   async initialize(params: MeetingParams): Promise<boolean> {
+    console.log('[ANALYTICS] ========================================');
+    console.log('[ANALYTICS] Initialize called');
+    console.log('[ANALYTICS] Room:', params.roomName);
+    console.log('[ANALYTICS] MTB ID:', params.mtbId);
+    
     if (!isSupabaseConfigured()) {
-      debugLog('[ANALYTICS] Supabase not configured, analytics disabled');
+      console.error('[ANALYTICS] ❌ Supabase not configured, analytics disabled');
+      return false;
+    }
+
+    if (!this.supabase) {
+      console.error('[ANALYTICS] ❌ Supabase client is null');
       return false;
     }
 
     if (!params.mtbId || !params.roomName) {
-      debugLog('[ANALYTICS] Missing required params (mtbId or roomName)');
+      console.error('[ANALYTICS] ❌ Missing required params (mtbId or roomName)');
       return false;
     }
 
     this.params = params;
-    debugLog('[ANALYTICS] ========================================');
-    debugLog('[ANALYTICS] Initializing for room:', params.roomName);
-    debugLog('[ANALYTICS] MTB ID:', params.mtbId);
+    this.hasEnded = false;
 
-    // Set up tab close handler
-    window.addEventListener('beforeunload', this.handleBeforeUnload);
+    // Set up visibility change handler (for extra heartbeat when tab becomes hidden)
     document.addEventListener('visibilitychange', this.handleVisibilityChange);
 
     this.isTracking = true;
-    debugLog('[ANALYTICS] ✓ Tracking initialized');
+    console.log('[ANALYTICS] ✓ Tracking initialized');
     return true;
   }
 
   /**
    * Called when the local participant joins the Jitsi room
-   * This is the first Jitsi event we receive after connection
+   * This creates or joins a meeting session
    */
   async onLocalParticipantJoined(participantId: string, displayName?: string): Promise<void> {
-    if (!this.isTracking || !this.params) return;
+    console.log('[ANALYTICS] ----------------------------------------');
+    console.log('[ANALYTICS] onLocalParticipantJoined:', participantId);
+    
+    if (!this.isTracking || !this.params) {
+      console.error('[ANALYTICS] ❌ Not tracking or missing params');
+      return;
+    }
 
-    debugLog('[ANALYTICS] Local participant joined:', participantId);
     this.currentParticipantId = participantId;
 
-    // Check for or create meeting session
-    await this.ensureMeetingSession();
+    // Get or create meeting session
+    await this.getOrCreateMeetingSession();
 
-    // Create participant record for the local user
+    if (!this.meetingSessionId) {
+      console.error('[ANALYTICS] ❌ Failed to get/create meeting session');
+      return;
+    }
+
+    // Create participant record
     await this.createParticipantRecord(participantId, displayName);
 
-    this.participantCount++;
-    this.updateMaxParticipants();
+    // Update participant count
+    this.participantCount = 1;
+    await this.updateMaxParticipants();
+
+    // Start heartbeat
+    this.startHeartbeat();
+    
+    console.log('[ANALYTICS] ✓ Local participant tracking started');
+  }
+
+  /**
+   * Get existing recent session OR create a new one
+   * Key: Only consider sessions with recent heartbeat (not stale)
+   */
+  private async getOrCreateMeetingSession(): Promise<void> {
+    if (!this.supabase || !this.params) return;
+
+    try {
+      // Calculate threshold: only sessions with heartbeat newer than this are "active"
+      const recentThreshold = new Date(Date.now() - STALE_THRESHOLD_MINUTES * 60 * 1000).toISOString();
+      
+      console.log('[ANALYTICS] Checking for recent active session...');
+      console.log('[ANALYTICS] Threshold:', recentThreshold);
+      
+      // Query for RECENT active session only
+      const { data: existingSession, error: fetchError } = await this.supabase
+        .from('meeting_sessions')
+        .select('*')
+        .eq('room_name', this.params.roomName)
+        .eq('status', 'active')
+        .gte('last_heartbeat', recentThreshold)  // ONLY recent heartbeats
+        .order('started_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();  // Returns null if not found, no error
+
+      if (fetchError) {
+        console.error('[ANALYTICS] Error checking for session:', fetchError);
+      }
+
+      if (existingSession) {
+        // Found a recent active session - join it
+        this.meetingSessionId = existingSession.id;
+        this.maxParticipants = existingSession.max_participants || 0;
+        console.log('[ANALYTICS] ✓ Joined existing session:', this.meetingSessionId);
+        return;
+      }
+
+      // No recent session found - create a new one
+      // Note: We do NOT close/modify stale sessions, we just ignore them
+      console.log('[ANALYTICS] No recent session found, creating new one...');
+      
+      const now = new Date().toISOString();
+      const { data: newSession, error: insertError } = await this.supabase
+        .from('meeting_sessions')
+        .insert({
+          mtb_id: this.params.mtbId,
+          room_name: this.params.roomName,
+          started_at: now,
+          last_heartbeat: now,
+          status: 'active',
+          max_participants: 1,
+        })
+        .select()
+        .single();
+
+      if (insertError) {
+        console.error('[ANALYTICS] ❌ Error creating session:', insertError);
+        return;
+      }
+
+      this.meetingSessionId = newSession.id;
+      console.log('[ANALYTICS] ✓ Created new session:', this.meetingSessionId);
+
+    } catch (error) {
+      console.error('[ANALYTICS] ❌ Exception in getOrCreateMeetingSession:', error);
+    }
+  }
+
+  /**
+   * Start sending heartbeats
+   */
+  private startHeartbeat(): void {
+    this.stopHeartbeat(); // Clear any existing
+
+    console.log('[ANALYTICS] Starting heartbeat (every 30s)');
+    
+    // First heartbeat immediately
+    this.sendHeartbeat();
+    
+    // Then every 30 seconds
+    this.heartbeatInterval = setInterval(() => {
+      this.sendHeartbeat();
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  /**
+   * Stop sending heartbeats
+   */
+  private stopHeartbeat(): void {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+  }
+
+  /**
+   * Send a heartbeat update
+   */
+  private async sendHeartbeat(): Promise<void> {
+    if (!this.supabase || !this.meetingSessionId || this.hasEnded) return;
+
+    try {
+      const { error } = await this.supabase
+        .from('meeting_sessions')
+        .update({ last_heartbeat: new Date().toISOString() })
+        .eq('id', this.meetingSessionId);
+
+      if (error) {
+        console.error('[ANALYTICS] Heartbeat error:', error.message);
+      } else {
+        console.log('[ANALYTICS] 💓 Heartbeat');
+      }
+    } catch (error) {
+      console.error('[ANALYTICS] Heartbeat exception:', error);
+    }
   }
 
   /**
@@ -112,17 +263,14 @@ export class MeetingAnalyticsService {
    */
   async onParticipantJoined(participantId: string, displayName?: string): Promise<void> {
     if (!this.isTracking || !this.meetingSessionId) return;
+    if (participantId === this.currentParticipantId) return; // Skip self
 
-    debugLog('[ANALYTICS] Remote participant joined:', participantId);
+    console.log('[ANALYTICS] Remote participant joined:', participantId);
 
-    // Only create records for remote participants, not ourselves
-    if (participantId !== this.currentParticipantId) {
-      await this.createParticipantRecord(participantId, displayName);
-    }
+    await this.createParticipantRecord(participantId, displayName);
 
     this.participantCount++;
-    this.updateMaxParticipants();
-    debugLog('[ANALYTICS] Participant count:', this.participantCount);
+    await this.updateMaxParticipants();
   }
 
   /**
@@ -130,96 +278,41 @@ export class MeetingAnalyticsService {
    */
   async onParticipantLeft(participantId: string): Promise<void> {
     if (!this.isTracking || !this.meetingSessionId) return;
+    if (participantId === this.currentParticipantId) return; // Skip self
 
-    debugLog('[ANALYTICS] Remote participant left:', participantId);
+    console.log('[ANALYTICS] Remote participant left:', participantId);
 
-    // Mark participant as left
     await this.markParticipantLeft(participantId, 'normal');
-
     this.participantCount = Math.max(0, this.participantCount - 1);
-    debugLog('[ANALYTICS] Participant count:', this.participantCount);
-
-    // Check if meeting should end (only the local user remains)
-    // Note: We don't end the meeting when a remote user leaves,
-    // only when the local user leaves (handled in onLocalParticipantLeft)
   }
 
   /**
-   * Called when the local participant leaves (normally or via hangup)
+   * Called when the local participant leaves via Jitsi event
+   * This is the ONLY time we mark the meeting as ended
    */
-  async onLocalParticipantLeft(reason: 'normal' | 'tab_closed' | 'disconnected' = 'normal'): Promise<void> {
-    if (!this.isTracking) return;
+  async onLocalParticipantLeft(reason: string = 'normal'): Promise<void> {
+    if (!this.isTracking || this.hasEnded) {
+      console.log('[ANALYTICS] Already ended or not tracking');
+      return;
+    }
+    
+    this.hasEnded = true;
+    console.log('[ANALYTICS] ========================================');
+    console.log('[ANALYTICS] Local participant leaving:', reason);
 
-    debugLog('[ANALYTICS] Local participant leaving:', reason);
+    // Stop heartbeat
+    this.stopHeartbeat();
 
-    // Mark our participant record as left
+    // Mark local participant as left
     if (this.localParticipantDbId) {
       await this.markParticipantLeftById(this.localParticipantDbId, reason);
     }
 
-    this.participantCount = Math.max(0, this.participantCount - 1);
+    // Mark meeting session as ended
+    await this.endMeetingSession();
 
-    // Check if we should end the meeting (we were the last participant)
-    await this.checkAndEndMeeting();
-
+    // Cleanup
     this.cleanup();
-  }
-
-  /**
-   * Get or create a meeting session for this room
-   */
-  private async ensureMeetingSession(): Promise<void> {
-    if (!this.supabase || !this.params) return;
-
-    try {
-      // First, check if there's already an active session for this room
-      const { data: existingSession, error: fetchError } = await this.supabase
-        .from('meeting_sessions')
-        .select('*')
-        .eq('room_name', this.params.roomName)
-        .eq('status', 'active')
-        .order('started_at', { ascending: false })
-        .limit(1)
-        .single();
-
-      if (fetchError && fetchError.code !== 'PGRST116') {
-        // PGRST116 = no rows found, which is expected for new meetings
-        debugLog('[ANALYTICS] Error checking for existing session:', fetchError.message);
-      }
-
-      if (existingSession) {
-        // Session already exists, use it
-        this.meetingSessionId = existingSession.id;
-        this.maxParticipants = existingSession.max_participants || 0;
-        debugLog('[ANALYTICS] Using existing session:', this.meetingSessionId);
-        return;
-      }
-
-      // No active session, create a new one
-      debugLog('[ANALYTICS] Creating new meeting session');
-      const { data: newSession, error: insertError } = await this.supabase
-        .from('meeting_sessions')
-        .insert({
-          mtb_id: this.params.mtbId,
-          room_name: this.params.roomName,
-          started_at: new Date().toISOString(),
-          status: 'active',
-          max_participants: 1, // At least 1 (the local user)
-        })
-        .select()
-        .single();
-
-      if (insertError) {
-        debugLog('[ANALYTICS] ❌ Error creating session:', insertError.message);
-        return;
-      }
-
-      this.meetingSessionId = newSession.id;
-      debugLog('[ANALYTICS] ✓ Created new session:', this.meetingSessionId);
-
-    } catch (error) {
-      debugLog('[ANALYTICS] ❌ Exception in ensureMeetingSession:', error);
-    }
   }
 
   /**
@@ -241,24 +334,23 @@ export class MeetingAnalyticsService {
         .single();
 
       if (error) {
-        debugLog('[ANALYTICS] ❌ Error creating participant record:', error.message);
+        console.error('[ANALYTICS] Error creating participant:', error);
         return;
       }
 
-      // Store the DB ID if this is the local participant
+      // Store DB ID if this is local participant
       if (participantId === this.currentParticipantId) {
         this.localParticipantDbId = data.id;
       }
 
-      debugLog('[ANALYTICS] ✓ Created participant record:', data.id);
-
+      console.log('[ANALYTICS] ✓ Created participant record');
     } catch (error) {
-      debugLog('[ANALYTICS] ❌ Exception in createParticipantRecord:', error);
+      console.error('[ANALYTICS] Exception creating participant:', error);
     }
   }
 
   /**
-   * Mark a participant as left by their Jitsi participant ID
+   * Mark a participant as left by Jitsi participant ID
    */
   private async markParticipantLeft(participantId: string, reason: string): Promise<void> {
     if (!this.supabase || !this.meetingSessionId) return;
@@ -266,8 +358,8 @@ export class MeetingAnalyticsService {
     try {
       const now = new Date();
       
-      // Find the most recent record for this participant without a left_at
-      const { data: participant, error: fetchError } = await this.supabase
+      // Find the participant record
+      const { data: participant } = await this.supabase
         .from('meeting_participants')
         .select('*')
         .eq('meeting_session_id', this.meetingSessionId)
@@ -275,17 +367,14 @@ export class MeetingAnalyticsService {
         .is('left_at', null)
         .order('joined_at', { ascending: false })
         .limit(1)
-        .single();
+        .maybeSingle();
 
-      if (fetchError || !participant) {
-        debugLog('[ANALYTICS] Could not find active participant record');
-        return;
-      }
+      if (!participant) return;
 
       const joinedAt = new Date(participant.joined_at);
       const durationSeconds = Math.floor((now.getTime() - joinedAt.getTime()) / 1000);
 
-      const { error: updateError } = await this.supabase
+      await this.supabase
         .from('meeting_participants')
         .update({
           left_at: now.toISOString(),
@@ -294,20 +383,13 @@ export class MeetingAnalyticsService {
         })
         .eq('id', participant.id);
 
-      if (updateError) {
-        debugLog('[ANALYTICS] ❌ Error updating participant:', updateError.message);
-        return;
-      }
-
-      debugLog('[ANALYTICS] ✓ Marked participant left, duration: ' + durationSeconds + 's');
-
     } catch (error) {
-      debugLog('[ANALYTICS] ❌ Exception in markParticipantLeft:', error);
+      console.error('[ANALYTICS] Error marking participant left:', error);
     }
   }
 
   /**
-   * Mark a participant as left by their database ID
+   * Mark a participant as left by database ID
    */
   private async markParticipantLeftById(dbId: string, reason: string): Promise<void> {
     if (!this.supabase) return;
@@ -315,28 +397,18 @@ export class MeetingAnalyticsService {
     try {
       const now = new Date();
 
-      // Get the participant record
-      const { data: participant, error: fetchError } = await this.supabase
+      const { data: participant } = await this.supabase
         .from('meeting_participants')
         .select('*')
         .eq('id', dbId)
-        .single();
+        .maybeSingle();
 
-      if (fetchError || !participant) {
-        debugLog('[ANALYTICS] Could not find participant by DB ID');
-        return;
-      }
-
-      // Skip if already marked as left
-      if (participant.left_at) {
-        debugLog('[ANALYTICS] Participant already marked as left');
-        return;
-      }
+      if (!participant || participant.left_at) return;
 
       const joinedAt = new Date(participant.joined_at);
       const durationSeconds = Math.floor((now.getTime() - joinedAt.getTime()) / 1000);
 
-      const { error: updateError } = await this.supabase
+      await this.supabase
         .from('meeting_participants')
         .update({
           left_at: now.toISOString(),
@@ -345,20 +417,14 @@ export class MeetingAnalyticsService {
         })
         .eq('id', dbId);
 
-      if (updateError) {
-        debugLog('[ANALYTICS] ❌ Error updating participant:', updateError.message);
-        return;
-      }
-
-      debugLog('[ANALYTICS] ✓ Marked local participant left, duration: ' + durationSeconds + 's');
-
+      console.log('[ANALYTICS] ✓ Marked local participant left');
     } catch (error) {
-      debugLog('[ANALYTICS] ❌ Exception in markParticipantLeftById:', error);
+      console.error('[ANALYTICS] Error marking participant left:', error);
     }
   }
 
   /**
-   * Update max participants count
+   * Update max participants if current count is higher
    */
   private async updateMaxParticipants(): Promise<void> {
     if (!this.supabase || !this.meetingSessionId) return;
@@ -366,81 +432,34 @@ export class MeetingAnalyticsService {
     if (this.participantCount > this.maxParticipants) {
       this.maxParticipants = this.participantCount;
       
-      try {
-        await this.supabase
-          .from('meeting_sessions')
-          .update({ max_participants: this.maxParticipants })
-          .eq('id', this.meetingSessionId);
-
-        debugLog('[ANALYTICS] Updated max participants:', this.maxParticipants);
-      } catch (error) {
-        debugLog('[ANALYTICS] ❌ Error updating max participants:', error);
-      }
-    }
-  }
-
-  /**
-   * Check if the meeting should end and end it
-   */
-  private async checkAndEndMeeting(): Promise<void> {
-    if (!this.supabase || !this.meetingSessionId) return;
-
-    try {
-      // Check how many participants are still active in this session
-      const { data: activeParticipants, error } = await this.supabase
-        .from('meeting_participants')
-        .select('id')
-        .eq('meeting_session_id', this.meetingSessionId)
-        .is('left_at', null);
-
-      if (error) {
-        debugLog('[ANALYTICS] Error checking active participants:', error.message);
-        return;
-      }
-
-      const activeCount = activeParticipants?.length || 0;
-      debugLog('[ANALYTICS] Active participants remaining:', activeCount);
-
-      // Only end meeting if no participants remain
-      if (activeCount === 0) {
-        await this.endMeetingSession();
-      }
-
-    } catch (error) {
-      debugLog('[ANALYTICS] ❌ Exception in checkAndEndMeeting:', error);
+      await this.supabase
+        .from('meeting_sessions')
+        .update({ max_participants: this.maxParticipants })
+        .eq('id', this.meetingSessionId);
     }
   }
 
   /**
    * End the meeting session
+   * Called ONLY when local user explicitly leaves via Jitsi event
    */
   private async endMeetingSession(): Promise<void> {
     if (!this.supabase || !this.meetingSessionId) return;
 
     try {
-      // Get the session to calculate duration
-      const { data: session, error: fetchError } = await this.supabase
+      const { data: session } = await this.supabase
         .from('meeting_sessions')
         .select('*')
         .eq('id', this.meetingSessionId)
-        .single();
+        .maybeSingle();
 
-      if (fetchError || !session) {
-        debugLog('[ANALYTICS] Could not find session to end');
-        return;
-      }
-
-      // Skip if already ended
-      if (session.status === 'ended') {
-        debugLog('[ANALYTICS] Session already ended');
-        return;
-      }
+      if (!session || session.status === 'ended') return;
 
       const now = new Date();
       const startedAt = new Date(session.started_at);
       const totalDurationSeconds = Math.floor((now.getTime() - startedAt.getTime()) / 1000);
 
-      const { error: updateError } = await this.supabase
+      await this.supabase
         .from('meeting_sessions')
         .update({
           ended_at: now.toISOString(),
@@ -449,55 +468,33 @@ export class MeetingAnalyticsService {
         })
         .eq('id', this.meetingSessionId);
 
-      if (updateError) {
-        debugLog('[ANALYTICS] ❌ Error ending session:', updateError.message);
-        return;
-      }
-
-      debugLog('[ANALYTICS] ========================================');
-      debugLog('[ANALYTICS] ✓ Meeting ended');
-      debugLog('[ANALYTICS] Duration: ' + totalDurationSeconds + 's');
-      debugLog('[ANALYTICS] Max participants:', this.maxParticipants);
-      debugLog('[ANALYTICS] ========================================');
+      console.log('[ANALYTICS] ✓ Meeting ended');
+      console.log('[ANALYTICS] Duration:', totalDurationSeconds, 'seconds');
+      console.log('[ANALYTICS] Max participants:', this.maxParticipants);
+      console.log('[ANALYTICS] ========================================');
 
     } catch (error) {
-      debugLog('[ANALYTICS] ❌ Exception in endMeetingSession:', error);
+      console.error('[ANALYTICS] Error ending session:', error);
     }
   }
 
   /**
-   * Handle browser tab close / page unload
-   * Uses sendBeacon for reliable delivery
-   */
-  private handleBeforeUnload(): void {
-    debugLog('[ANALYTICS] beforeunload event');
-    
-    // Use synchronous approach for tab close
-    // Mark participant as left with 'tab_closed' reason
-    if (this.supabase && this.localParticipantDbId) {
-      // sendBeacon doesn't work well with Supabase client
-      // Instead, rely on visibility change and the session cleanup logic
-      this.onLocalParticipantLeft('tab_closed');
-    }
-  }
-
-  /**
-   * Handle page visibility changes (tab becomes hidden)
+   * Handle visibility change - send heartbeat when tab becomes hidden
    */
   private handleVisibilityChange(): void {
-    if (document.visibilityState === 'hidden') {
-      debugLog('[ANALYTICS] Page became hidden');
-      // Could use this for additional tracking
+    if (document.visibilityState === 'hidden' && this.isTracking && !this.hasEnded) {
+      console.log('[ANALYTICS] Tab hidden - sending heartbeat');
+      this.sendHeartbeat();
     }
   }
 
   /**
-   * Clean up event handlers and state
+   * Cleanup resources
    */
   cleanup(): void {
-    debugLog('[ANALYTICS] Cleaning up');
+    console.log('[ANALYTICS] Cleanup');
     
-    window.removeEventListener('beforeunload', this.handleBeforeUnload);
+    this.stopHeartbeat();
     document.removeEventListener('visibilitychange', this.handleVisibilityChange);
     
     this.isTracking = false;
@@ -509,16 +506,10 @@ export class MeetingAnalyticsService {
     this.maxParticipants = 0;
   }
 
-  /**
-   * Get current meeting session ID (for debugging)
-   */
   getMeetingSessionId(): string | null {
     return this.meetingSessionId;
   }
 
-  /**
-   * Check if analytics tracking is active
-   */
   isActive(): boolean {
     return this.isTracking;
   }
