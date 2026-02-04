@@ -4,7 +4,7 @@ import ErrorPage from '../components/ErrorPage'
 import ThankYouPage from '../components/ThankYouPage'
 import { MeetingService } from '../services/meetingService'
 import { meetingAnalytics } from '../services/meetingAnalytics'
-import { getRoomNameFromUrl, getMeetingParamsFromUrl, debugLog } from '../utils/sanitization'
+import { getMeetingParamsFromUrl, debugLog } from '../utils/sanitization'
 
 type PageState = 'LOADING' | 'READY' | 'ERROR' | 'THANK_YOU'
 
