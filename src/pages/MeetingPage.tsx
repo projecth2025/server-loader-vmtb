@@ -3,7 +3,8 @@ import MeetingLoader from '../components/MeetingLoader'
 import ErrorPage from '../components/ErrorPage'
 import ThankYouPage from '../components/ThankYouPage'
 import { MeetingService } from '../services/meetingService'
-import { getRoomNameFromUrl, debugLog } from '../utils/sanitization'
+import { meetingAnalytics } from '../services/meetingAnalytics'
+import { getRoomNameFromUrl, getMeetingParamsFromUrl, debugLog } from '../utils/sanitization'
 
 type PageState = 'LOADING' | 'READY' | 'ERROR' | 'THANK_YOU'
 
@@ -24,7 +25,9 @@ export default function MeetingPage() {
   const jitsiApiRef = useRef<any>(null)
   const timerIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const roomNameRef = useRef<string>('')
+  const mtbIdRef = useRef<string>('')
   const jitsiContainerRef = useRef<HTMLDivElement | null>(null)
+  const analyticsInitializedRef = useRef(false)
 
   // Cleanup timer
   const stopTimer = useCallback(() => {
@@ -48,6 +51,9 @@ export default function MeetingPage() {
   const handleMeetingEnd = useCallback(() => {
     debugLog('[MEETING-END] ========================================')
     debugLog('[MEETING-END] User left the conference')
+
+    // Track local participant leaving for analytics
+    meetingAnalytics.onLocalParticipantLeft('normal')
 
     // Dispose Jitsi API
     if (jitsiApiRef.current) {
@@ -106,15 +112,43 @@ export default function MeetingPage() {
       jitsiApiRef.current = api
       debugLog('[JITSI] ✓ API created')
 
-      // Event handlers
-      api.addEventListener('videoConferenceLeft', () => {
-        debugLog('[JITSI] Event: videoConferenceLeft')
+      // ========================================
+      // Analytics Event Handlers
+      // ========================================
+
+      // Track when local user joins the conference
+      api.addEventListener('videoConferenceJoined', (event: { roomName: string; id: string; displayName?: string }) => {
+        debugLog('[JITSI] Event: videoConferenceJoined', event)
+        // Local user has joined - this triggers meeting session creation
+        meetingAnalytics.onLocalParticipantJoined(event.id, event.displayName)
+      })
+
+      // Track when a remote participant joins
+      api.addEventListener('participantJoined', (event: { id: string; displayName?: string }) => {
+        debugLog('[JITSI] Event: participantJoined', event)
+        meetingAnalytics.onParticipantJoined(event.id, event.displayName)
+      })
+
+      // Track when a remote participant leaves
+      api.addEventListener('participantLeft', (event: { id: string }) => {
+        debugLog('[JITSI] Event: participantLeft', event)
+        meetingAnalytics.onParticipantLeft(event.id)
+      })
+
+      // Track disconnection (network issues)
+      api.addEventListener('videoConferenceLeft', (event: { roomName: string }) => {
+        debugLog('[JITSI] Event: videoConferenceLeft', event)
         handleMeetingEnd()
       })
 
       api.addEventListener('readyToClose', () => {
         debugLog('[JITSI] Event: readyToClose')
         handleMeetingEnd()
+      })
+
+      // Track when participant's display name changes (optional, for better tracking)
+      api.addEventListener('displayNameChange', (event: { id: string; displayname: string }) => {
+        debugLog('[JITSI] Event: displayNameChange', event)
       })
 
       debugLog('[JITSI] ========================================')
@@ -194,16 +228,33 @@ export default function MeetingPage() {
     debugLog('[INIT] Starting initialization')
     debugLog('[INIT] URL:', window.location.href)
 
-    // Get room name from URL
-    const room = getRoomNameFromUrl()
-    if (!room) {
+    // Get meeting parameters from URL (room, mtb_id, mtb_name)
+    const meetingParams = getMeetingParamsFromUrl()
+    
+    if (!meetingParams.roomName) {
       debugLog('[INIT] ❌ No room in URL')
       setError('No room name provided. Please start the meeting from the main app.')
       setState('ERROR')
       return
     }
-    roomNameRef.current = room
-    debugLog('[INIT] Room:', room)
+    
+    roomNameRef.current = meetingParams.roomName
+    mtbIdRef.current = meetingParams.mtbId || ''
+    debugLog('[INIT] Room:', meetingParams.roomName)
+    debugLog('[INIT] MTB ID:', meetingParams.mtbId)
+    debugLog('[INIT] MTB Name:', meetingParams.mtbName)
+
+    // Initialize analytics if mtb_id is available
+    if (meetingParams.mtbId && !analyticsInitializedRef.current) {
+      analyticsInitializedRef.current = true
+      meetingAnalytics.initialize({
+        roomName: meetingParams.roomName,
+        mtbId: meetingParams.mtbId,
+        mtbName: meetingParams.mtbName || undefined,
+      }).then((success) => {
+        debugLog('[INIT] Analytics initialized:', success)
+      })
+    }
 
     // Start the elapsed time timer
     startTimer()
@@ -252,6 +303,9 @@ export default function MeetingPage() {
         meetingServiceRef.current.cleanup()
         meetingServiceRef.current = null
       }
+      // Cleanup analytics
+      meetingAnalytics.cleanup()
+      analyticsInitializedRef.current = false
       // Reset initialization flag so StrictMode remount can re-initialize
       isInitializedRef.current = false
     }
